@@ -1,0 +1,80 @@
+// Load your sites from the uploaded .csv
+var sites = ee.FeatureCollection("projects/ee-kevinthabomoore/assets/latlon2");
+
+// Function to explicitly create a point geometry from Latitude and Longitude and buffer it
+var createPoint = function(feature) {
+  var lat = ee.Number(feature.get('Latitude'));
+  var lon = ee.Number(feature.get('Longitude'));
+  
+  // Create point geometry
+  var point = ee.Geometry.Point([lon, lat]);
+  
+  // Buffer to 30x30 meter area
+  var buffer = point.buffer(15);  // 15 meter buffer gives a 30x30 meter area
+  
+  // Return feature with proper geometry
+  return feature.setGeometry(buffer);
+};
+
+// Apply the point creation function to all sites
+var bufferedSites = sites.map(createPoint);
+
+// Function to process each site and calculate the mean ETa
+var processSite = function(feature) {
+  var location = feature.get('Location'); // Get the site name
+  var rawDate = feature.get('Date'); // Get the date (already in YYYY-MM-DD format)
+  
+  // Parse the date
+  var siteDate = ee.Date(rawDate);
+  
+  // Define the time window (3 weeks before the date)
+  var startDate = siteDate.advance(-3, 'week');
+  var endDate = siteDate;
+
+  // Load the ETa dataset
+  var etaCollection = ee.ImageCollection("TERN/AET/CMRSET_LANDSAT_V2_2").select('ETa');
+
+  // Filter the ETa collection for the 3 weeks prior to the site's date
+  var etaFiltered = etaCollection.filterDate(startDate, endDate);
+
+  // Check if the filtered collection has images
+  var collectionSize = etaFiltered.size();
+  
+  // Initialize meanEta as null
+  var meanEta = null;
+  
+  if (collectionSize.gt(0)) {
+    // Calculate the mean ETa over the 30x30 meter area
+    var regionStats = etaFiltered.mean().reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: feature.geometry(),
+      scale: 30,  // 30 meter resolution
+      maxPixels: 1e9
+    });
+    
+    // Check if the 'ETa' key exists in the dictionary
+    meanEta = ee.Algorithms.If(regionStats.contains('ETa'), regionStats.get('ETa'), null);
+  }
+
+  // Return the feature with the mean ETa and date info
+  return feature.set({
+    'Mean_ETa': meanEta,
+    'StartDate': startDate,
+    'EndDate': endDate,
+    'ParsedDate': siteDate.format('YYYY-MM-DD'),
+    'Error': meanEta === null ? 'No ETa data available or outside valid region' : null
+  });
+};
+
+// Map the processing function to all features
+var processedSites = bufferedSites.map(processSite);
+
+// Print the processed results to verify
+print('Processed Sites:', processedSites);
+
+// Export the results to Google Drive as a CSV file
+Export.table.toDrive({
+  collection: processedSites,
+  description: 'Mean_ETa_Per_Location',
+  fileFormat: 'CSV'
+});
