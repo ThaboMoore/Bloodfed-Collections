@@ -1,0 +1,108 @@
+Map.setOptions('HYBRID');
+
+// Cloud masking function
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// Define points with unique dates
+var points = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'GWBetween_north_sheds', date: '2024-02-05'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'GWBig_tree', date: '2024-02-05'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'GWBins_N', date: '2024-02-06'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'GWNS_bins', date: '2024-02-06'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'GWNorth_effluent_pond', date: '2024-02-05'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'GWRidge', date: '2024-02-05'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'GWSS_bins', date: '2024-02-05'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'NGN1', date: '2024-02-10'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'NGN2', date: '2024-02-10'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'NGN3', date: '2024-02-10'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'NGN4', date: '2024-02-10'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'NGWL1', date: '2024-02-10'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'NGWL2', date: '2024-02-10'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: '1PPL1', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: '1PPL2', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: '1PPL3', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: '2PPL1', date: '2023-12-13'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: '2PPL2', date: '2023-12-13'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: '2PPL3', date: '2023-12-13'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: '1PPL4', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: '2PPL4', date: '2023-12-13'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'TLN1', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'TLN3', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'WKCreek', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'WKFirst_bend', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'WKMain_Road', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'WKOld_shed', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'WKRoad', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'WKSheds', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon]), {name: 'WML1', date: '2024-03-15'}),
+  ee.Feature(ee.Geometry.Point([lat, lon3]), {name: 'WML2', date: '2024-03-15'})
+]);
+
+// Apply a 20-meter radius buffer to each point
+var bufferedSites = points.map(function(feature) {
+  return feature.buffer(20).set('name', feature.get('name')).set('date', feature.get('date'));
+});
+
+// Add the buffered sites to the map
+Map.addLayer(bufferedSites, {}, 'Buffered Sites');
+
+// Initialize an empty FeatureCollection to store results
+var allResults = ee.FeatureCollection([]);
+
+// Process each feature in the FeatureCollection
+bufferedSites.toList(bufferedSites.size()).evaluate(function(features) {
+  for (var i = 0; i < features.length; i++) {
+    var feature = ee.Feature(features[i]);
+    var name = feature.get('name');
+    var date = ee.Date(feature.get('date'));
+    
+    var iniDate = date.advance(-3, 'week');
+    var endDate = date.advance(3, 'week');
+
+    var Image_collection = ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
+      .filterDate(iniDate, endDate)
+      .sort('CLOUD_COVER')
+      .filterBounds(feature.geometry())
+      .filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', 15)
+      .map(maskS2clouds);
+
+    if (Image_collection.size().getInfo() > 0) {
+      var NDMI_mappping = function(image) {
+        var NDMI_func = image.normalizedDifference(['B3', 'B8']).rename('NDMI');
+        return image.addBands(NDMI_func).select('NDMI');
+      };
+
+      var S2 = Image_collection.map(NDMI_mappping);
+      var MedianNDMI = S2.reduce(ee.Reducer.median());
+
+      if (MedianNDMI.bandNames().size().getInfo() > 0) {
+        var ndviStats = MedianNDMI.reduceRegions({
+          collection: ee.FeatureCollection([feature]),
+          reducer: ee.Reducer.mean(),
+          scale: 20
+        }).map(function(stat) {
+          return stat.set('name', name).set('date', date.format('yyyy-MM-dd'));
+        });
+
+        allResults = allResults.merge(ndviStats);
+      } else {
+        print('Median NDMI has no bands for:', name, date);
+      }
+    } else {
+      print('Empty Image Collection for:', name, date);
+    }
+  }
+
+  Export.table.toDrive({
+    collection: allResults,
+    description: 'Combined_NDMI_Results',
+    fileFormat: 'CSV'
+  });
+});
