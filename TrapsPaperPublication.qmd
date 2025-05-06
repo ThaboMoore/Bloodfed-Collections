@@ -1,0 +1,653 @@
+---
+title: "TrapsGLMMForPublication"
+format: html
+editor: visual
+---
+
+## Overview
+
+Generalized Linear Mixed Model (GLMM) with a Negative Binomial distribution.
+
+I chose a GLM over linear regression because our data are grouped by Site and this has an effect on bloodmeal counts. Linear regression assumes the data are independent.
+
+## Preparing the raw bloodfed count data
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(RColorBrewer)
+library(knitr)
+library(lubridate)
+library(here)
+
+trapsdf <- read_excel(here("BloodmealDataPublication.xlsx"))
+
+trap_totals <- trapsdf %>%
+  filter(Collection_Method != "Shed") %>%
+  group_by(Field_Storage_Tag) %>%
+  summarise(
+    Total_BF_Count = sum(if_else(Sella_Score %in% c(7, 8), 0, BF_Count_DuringID), na.rm = TRUE),
+    Site = first(Site),
+    Date = first(Date),
+    Location = paste(first(Site), first(Location), sep = ""),
+    Collection_Method = first(Collection_Method),
+    Number_of_bins_bags = first(Number_of_bins_bags),
+    Collection_Time_Minutes = first(Collection_Time_Minutes),
+    Sorting_Time_Minutes = first(Sorting_Time_Minutes),
+    Setup_Time_Minutes = first(Setup_Time_Minutes),
+    Change_Time_Minutes = first(Change_Time_Minutes), 
+    Collection_plus_Sorting = first(Collection_Time_Minutes) + first(Sorting_Time_Minutes),
+    totaltime = sum(c(first(Collection_Time_Minutes), first(Sorting_Time_Minutes)), na.rm = TRUE)
+  ) %>%
+  # Apply standardization after summarisation
+  mutate(
+    # Ensure that bin/bag numbers are set to 1 for non-bin/bag collection methods
+    Number_of_bins_bags = if_else(Collection_Method %in% c("CO2", "BG", "Aspiration"), 1, Number_of_bins_bags),
+    
+    # Calculate mosquitoes per bin/bag for each Field_Storage_Tag
+    Mosquitoes_per_bin_bag = Total_BF_Count / Number_of_bins_bags,
+    
+    # Standardize counts for bins and bags: multiply by 10 for bins and by 20 for bags
+    Standardized_Count = case_when(
+      Collection_Method == "Bin" ~ Mosquitoes_per_bin_bag * 10,
+      Collection_Method == "Bag" ~ Mosquitoes_per_bin_bag * 20,
+      
+      # Standardize aspiration to a 10-minute collection time
+      Collection_Method == "Aspiration" ~ (Total_BF_Count / Collection_Time_Minutes) * 10,
+      
+      # For other collection methods, keep the original count
+      TRUE ~ Total_BF_Count
+    )
+  )%>%
+  mutate(Standardized_Count = round(Standardized_Count))
+```
+
+## Preparing the environmental covariates
+
+```{r}
+## Precipitation ##
+
+precip_data_list <- list(
+  "NG" = read.csv(here("Piggery2Precip.csv")),
+  "GW" = read.csv(here("Piggery1Precip.csv")),
+  "TL" = read.csv(here("Piggery3Precip.csv")),
+  "1PP" = read.csv(here("Piggery4Precip.csv")),
+  "2PP" = read.csv(here("Piggery4Precip.csv")),
+  "WK" = read.csv(here("Piggery5Precip.csv")),
+  "WM" = read.csv(here("WestmarPrecip.csv"))
+)
+
+# Convert Year, Month, Day to Date in each site's precipitation data
+precip_data_list <- lapply(precip_data_list, function(df) {
+  df %>%
+    mutate(Date = make_date(Year, Month, Day))
+})
+
+# Modify the function to select the correct site-specific precipitation data
+calculate_precip_21days <- function(site_name, target_date) {
+  site_data <- precip_data_list[[site_name]]
+  site_data %>%
+    filter(Date < target_date & Date >= target_date - days(21)) %>%
+    summarize(TotalPrecip = sum(`Rainfall.amount..millimetres.`, na.rm = TRUE)) %>%
+    pull(TotalPrecip)
+}
+
+# Loop through each row in trap_totals and calculate precipitation
+trap_totals <- trap_totals %>%
+  rowwise() %>%
+  mutate(Precip = calculate_precip_21days(Site, Date))
+
+## Evapotranspiration ##
+
+evapo <- read.csv(here("Mean_ETa_Per_Location.csv"))
+
+evapo_selected <- evapo %>% select(Location, Evapo)
+
+trap_totals <- merge(trap_totals, evapo_selected, by = "Location")
+
+## Temperature ##
+
+temp_data_list <- list(
+  "NG" = read.csv(here("Piggery2Temp.csv")),
+  "GW" = read.csv(here("Piggery1Temp.csv")),
+  "TL" = read.csv(here("Piggery3Temp.csv")),
+  "1PP" = read.csv(here("Piggery4WestmarTemp.csv")),
+  "2PP" = read.csv(here("Piggery4WestmarTemp.csv")),
+  "WK" = read.csv(here("Piggery5Temp.csv")),
+  "WM" = read.csv(here("Piggery4WestmarTemp.csv"))
+)
+
+# Convert Year, Month, Day to Date in each site's temperature data
+temp_data_list <- lapply(temp_data_list, function(df) {
+  df %>%
+    mutate(Date = make_date(Year, Month, Day))
+})
+
+# Modify the function to select the temperature data for the specific date
+get_temperature_for_date <- function(site_name, target_date) {
+  site_data <- temp_data_list[[site_name]]
+  site_data %>%
+    filter(Date == target_date) %>%
+    summarize(Temp = mean(`Minimum.temperature..Degree.C.`, na.rm = TRUE)) %>%
+    pull(Temp)
+}
+
+# Loop through each row in trap_totals and add temperature for the exact date
+trap_totals <- trap_totals %>%
+  rowwise() %>%
+  mutate(Temperature = get_temperature_for_date(Site, Date))
+
+## NDVI ## 
+NDVI <- read.csv(here("Combined_NDVI_Results.csv")) %>%
+  rename(Location = name, NDVI = mean) %>% # Rename columns
+  select(Location, NDVI)
+
+trap_totals <- merge(trap_totals, NDVI, by = "Location")
+
+## NDWI ## 
+NDWI <- read.csv(here("Combined_NDWI_Results.csv")) %>%
+  rename(Location = name, NDWI = mean) %>% # Rename columns
+  select(Location, NDWI)
+
+trap_totals <- merge(trap_totals, NDWI, by = "Location")
+
+## NDMI ## 
+NDMI <- read.csv(here("Combined_NDMI_Results.csv")) %>%
+  rename(Location = name, NDMI = mean) %>% # Rename columns
+  select(Location, NDMI)
+
+trap_totals <- merge(trap_totals, NDMI, by = "Location")
+```
+
+### To figure out which of the Sentinel calculations works best. Looks like NDWI does.
+
+```{r}
+library(glmmTMB)
+library(MuMIn)
+
+global_model <- glmmTMB(Standardized_Count ~ Collection_Method + NDVI + NDMI + NDWI +
+                        (1 | Location/Date), 
+                        data = trap_totals, 
+                        family = nbinom2)
+
+# Ensure global model is set as the base for dredging
+options(na.action = "na.fail")  # Required for dredge function
+
+# Dredge to create all possible models
+model_set_ND <- dredge(global_model)
+
+model_NDVI <- glmmTMB(Standardized_Count ~ Collection_Method + NDVI + (1 | Location/Date),
+                      data = trap_totals, 
+                      family = nbinom2)
+
+model_NDMI <- glmmTMB(Standardized_Count ~ Collection_Method + NDMI + (1 | Location/Date),
+                      data = trap_totals, 
+                      family = nbinom2)
+
+model_NDWI <- glmmTMB(Standardized_Count ~ Collection_Method + NDWI + (1 | Location/Date),
+                      data = trap_totals, 
+                      family = nbinom2)
+
+# Compare models
+AIC(model_NDVI, model_NDMI, model_NDWI)
+```
+
+## Now let's look at all the fixed effects including NDWI.
+
+Collection_Method + Precip + NDWI + Temperature has the lowest AUCc.
+
+```{r}
+library(glmmTMB)
+library(MuMIn)
+
+global_model <- glmmTMB(Standardized_Count ~ Collection_Method + NDWI + Precip + evapo + Temperature +
+                        (1 | Site/Location/Date), 
+                        data = trap_totals, 
+                        family = nbinom2)
+
+# Ensure global model is set as the base for dredging
+options(na.action = "na.fail")  # Required for dredge function
+
+# Dredge to create all possible models
+model_set <- dredge(global_model)
+
+# Simplify random effects structure
+global_model_xSite <- glmmTMB(Standardized_Count ~ Collection_Method + NDWI + Precip + Evapo + Temperature +
+                        (1 | Location/Date), 
+                        data = trap_totals, 
+                        family = nbinom2)
+
+# Ensure global model is set as the base for dredging
+options(na.action = "na.fail")  # Required for dredge function
+
+# Dredge to create all possible models
+model_set_xSite <- dredge(global_model_xSite)
+```
+
+## Fitting all combinations of fixed and random effects
+
+Tested every combination of fixed effects, random intercepts, and random slopes. Compared models using AIC and identified the best-performing models (ΔAIC ≤ 2). Validated the top model using DHARMa residual diagnostics.
+
+```{r}
+# Load necessary libraries
+library(glmmTMB)
+library(MuMIn)
+library(DHARMa)
+
+# Define fixed effects, random effects structures, and random slopes
+fixed_effects <- c("Collection_Method", "NDWI", "Precip", "Evapo", "Temperature")
+random_effects <- list(
+  "Site/Location/Date",
+  "Site",
+  "Location",
+  "Date",
+  "Location/Date",
+  "Site/Location"
+)
+random_slopes <- c("", "NDWI", "Precip", "Evapo", "Temperature")
+
+# Generate all combinations of fixed effects
+generate_fixed_effects <- function(fixed_effects) {
+  do.call(c, lapply(1:length(fixed_effects), function(m) {
+    combn(fixed_effects, m, simplify = FALSE, FUN = function(x) paste(x, collapse = " + "))
+  }))
+}
+
+
+# Generate random effects formulas
+generate_random_effects <- function(random_effect, random_slope) {
+  if (random_slope == "") {
+    paste0("(1 | ", random_effect, ")")
+  } else {
+    paste0("(1 + ", random_slope, " | ", random_effect, ")")
+  }
+}
+
+# Combine fixed and random effects into full formulas
+generate_formulas <- function(fixed_effects, random_effects, random_slopes) {
+  fixed_combinations <- generate_fixed_effects(fixed_effects)
+  formulas <- list()
+  
+  for (fixed in fixed_combinations) {
+    for (random_effect in random_effects) {
+      for (random_slope in random_slopes) {
+        random_formula <- generate_random_effects(random_effect, random_slope)
+        full_formula <- paste("Standardized_Count ~", fixed, "+", random_formula)
+        formulas <- append(formulas, list(full_formula))
+      }
+    }
+  }
+  
+  return(formulas)
+}
+
+# Generate all formulas
+all_formulas <- generate_formulas(fixed_effects, random_effects, random_slopes)
+
+# Fit all models and store results
+model_results <- list()
+for (i in seq_along(all_formulas)) {
+  formula <- as.formula(all_formulas[[i]])
+  tryCatch({
+    model <- glmmTMB(formula, data = trap_totals, family = nbinom2)
+    model_results[[i]] <- list(
+      formula = deparse(formula),
+      model = model,
+      AIC = AIC(model),
+      logLik = logLik(model),
+      convergence = model$fit$convergence
+    )
+  }, error = function(e) {
+    model_results[[i]] <- list(
+      formula = deparse(formula),
+      model = NULL,
+      AIC = NA,
+      logLik = NA,
+      convergence = NA
+    )
+  })
+}
+
+# Extract results into a data frame
+results_df <- do.call(rbind, lapply(model_results, function(x) {
+  data.frame(
+    Formula = x$formula,
+    AIC = x$AIC,
+    LogLik = x$logLik,
+    Convergence = x$convergence
+  )
+}))
+
+# Order results by AIC
+results_df <- results_df[order(results_df$AIC), ]
+
+# Display the top models
+head(results_df)
+
+# Add Delta AIC to the results
+results_df$Delta_AIC <- results_df$AIC - min(results_df$AIC, na.rm = TRUE)
+
+# Identify best models (Delta AIC <= 2)
+best_models <- subset(results_df, Delta_AIC <= 2)
+
+# Display best models
+print(best_models)
+
+# Validate the top model with DHARMa
+if (nrow(best_models) > 0) {
+  best_model <- model_results[[which.min(results_df$AIC)]]$model
+  simulation_output <- simulateResiduals(fittedModel = best_model)
+  plot(simulation_output)
+}
+```
+
+## Comparing top models and testing random slope structure
+
+Fit the top model with a random slope for temperature by location and compared it to simpler alternatives. Used AIC to decide whether the added complexity improved model fit.
+
+```{r}
+library(glmmTMB)
+library(MuMIn)
+
+top_model <- glmmTMB(Standardized_Count ~ Collection_Method + NDWI + Precip + Evapo + Temperature +
+                        (1 + Temperature | Location), 
+                        data = trap_totals, 
+                        family = nbinom2)
+summary(top_model)
+
+simpler_model <- glmmTMB(
+  Standardized_Count ~ Collection_Method + NDWI + Precip + Evapo + Temperature +
+    (1 | Location),
+  data = trap_totals,
+  family = nbinom2
+)
+
+AIC(top_model, simpler_model)
+
+VarCorr(top_model)
+
+another_model <- glmmTMB(
+  Standardized_Count ~ Collection_Method + NDWI + Precip + Temperature +
+    (1 | Location/Date),
+  data = trap_totals,
+  family = nbinom2
+)
+
+AIC(simpler_model, another_model)
+
+summary(another_model)
+VarCorr(another_model)
+```
+
+## Checking model fit and residuals
+
+```{r}
+trap_totals$Predicted <- predict(another_model, type = "response")
+
+library(ggplot2)
+
+ggplot(trap_totals, aes(x = Predicted, y = Standardized_Count)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  facet_wrap(~ Location) +  # Adjust grouping variable as needed
+  labs(x = "Predicted Count", y = "Observed Count") +
+  theme_minimal()
+
+library(DHARMa)
+simulation_output <- simulateResiduals(fittedModel = another_model)
+plot(simulation_output)
+
+trap_totals$Residuals <- residuals(another_model, type = "pearson")
+
+ggplot(trap_totals, aes(x = Predicted, y = Residuals)) +
+  geom_point(alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  facet_wrap(~ Location) +  # Adjust grouping variable as needed
+  labs(x = "Predicted Count", y = "Standardized Residuals") +
+  theme_minimal()
+```
+
+## Testing for density effects on trap performance
+
+```{r}
+library(glmmTMB)
+
+
+# Calculate Site-Level Density (mean mosquito count per site)
+trap_totals$Site_Density <- ave(trap_totals$Standardized_Count, trap_totals$Site, FUN = mean)
+
+trap_totals$Location_Density <- ave(trap_totals$Standardized_Count, trap_totals$Location, FUN = mean)
+# Fit the GLMM with an interaction between Collection_Method and Site_Density
+site_interaction_model <- glmmTMB(
+  Standardized_Count ~ Collection_Method * Site_Density + NDWI + Precip + Temperature + (1 | Location/Date),
+  data = trap_totals,
+  family = nbinom2
+)
+
+location_interaction_model <- glmmTMB(
+  Standardized_Count ~ Collection_Method * Location_Density + NDWI + Precip + Temperature + (1 | Location/Date),
+  data = trap_totals,
+  family = nbinom2
+)
+
+# Summarize the model
+summary(site_interaction_model)
+summary(location_interaction_model)
+AIC(another_model, site_interaction_model)
+AIC(site_interaction_model, location_interaction_model)
+
+
+# Check model diagnostics (optional, if DHARMa is available)
+library(DHARMa)
+simulation_output <- simulateResiduals(fittedModel = interaction_model)
+plot(simulation_output)
+```
+
+## Adding a quadratic term for density
+
+Tested whether a quadratic relationship between Location_Density and bloodfed mosquito counts improved model fit.
+
+```{r}
+polynomial_model <- glmmTMB(
+  Standardized_Count ~ Collection_Method * Location_Density + poly(Location_Density, 2) + NDWI +
+    Precip + Temperature + (1 | Location/Date),
+  data = trap_totals,
+  family = nbinom2
+)
+summary(polynomial)
+
+simpler_quadratic_model <- glmmTMB(
+  Standardized_Count ~ Collection_Method * Location_Density + I(Location_Density^2) + NDWI + 
+    Precip + Temperature + (1 | Location/Date),
+  data = trap_totals,
+  family = nbinom2
+)
+summary(simpler_quadratic_model)
+```
+
+## 10-fold cross-validation of final model
+
+```{r}
+library(caret)
+train_control <- trainControl(method = "cv", number = 10)
+cv_model <- train(
+  Standardized_Count ~ Collection_Method * Location_Density + NDWI + Precip + Temperature,
+  data = trap_totals,
+  method = "glm",
+  family = negative.binomial(theta = location_interaction_model$fit$par[["theta"]]),
+  trControl = train_control
+)
+summary(cv_model)
+```
+
+## Plotting the interaction between trap type and mosquito density
+
+```{r}
+library(ggplot2)
+
+# Generate the data for prediction, including all required variables
+interaction_data <- data.frame(
+  Location_Density = seq(min(trap_totals$Location_Density, na.rm = TRUE), max(trap_totals$Location_Density, na.rm = TRUE), length.out = 100),
+  Collection_Method = rep(unique(trap_totals$Collection_Method), each = 100),
+  NDWI = mean(trap_totals$NDWI, na.rm = TRUE),          # Replace with mean NDWI
+  Precip = mean(trap_totals$Precip, na.rm = TRUE),      # Replace with mean precipitation
+  Temperature = mean(trap_totals$Temperature, na.rm = TRUE), # Replace with mean temperature
+  Location = "Placeholder",  # Add a placeholder for the Location variable
+  Date = as.Date("2024-01-01")  # Add a placeholder Date
+)
+
+# Predict values using the model
+interaction_data$Predicted_Count <- predict(location_interaction_model, newdata = interaction_data, type = "response")
+
+# Plot the results
+ggplot(interaction_data, aes(x = Location_Density, y = Predicted_Count, color = Collection_Method)) +
+  geom_line(size = 1) +
+  labs(
+    x = "Mosquito Density at Location",
+    y = "Predicted Mosquito Count",
+    title = "Interaction Between Collection Method and Location Mosquito Density",
+    color = "Collection Method"
+  ) +
+  theme_minimal()
+```
+
+## Summarising and exporting the final model
+
+```{r}
+# Load necessary libraries
+library(glmmTMB)
+library(broom.mixed)
+library(dplyr)
+library(kableExtra)
+library(tibble)
+
+
+# Fit your final model (example; replace with your actual model object)
+final_model <- glmmTMB(
+  Standardized_Count ~ Collection_Method * Location_Density + NDWI + Precip + Temperature +
+    (1 | Location/Date),
+  data = trap_totals,
+  family = nbinom2
+)
+
+# Extract fixed effects summary
+fixed_effects <- broom.mixed::tidy(final_model, effects = "fixed") %>%
+  mutate(Category = "Fixed Effects")
+
+# Add confidence intervals using confint()
+conf_intervals <- confint(final_model, parm = "beta_", level = 0.95) %>%
+  as.data.frame() %>%
+  rename(conf.low = `2.5 %`, conf.high = `97.5 %`) %>%
+  rownames_to_column("term")
+
+# Merge confidence intervals with fixed effects
+fixed_effects <- fixed_effects %>%
+  left_join(conf_intervals, by = "term") %>%
+  select(Category, term, estimate, std.error, conf.low, conf.high, p.value)
+
+# Extract random effects summary
+random_effects <- broom.mixed::tidy(final_model, effects = "ran_pars") %>%
+  mutate(Category = "Random Effects") %>%
+  select(Category, group, term, estimate) %>%
+  rename(term = group, std.error = term, conf.low = term, conf.high = term, p.value = term) %>%
+  mutate(std.error = NA, conf.low = NA, conf.high = NA, p.value = NA)
+
+# Extract model fit statistics with correct length
+model_fit <- data.frame(
+  Category = "Model Fit Statistics",
+  term = c("AIC", "Dispersion Parameter", "Log-Likelihood"),
+  estimate = c(AIC(final_model), sigma(final_model), as.numeric(logLik(final_model))),
+  std.error = NA,
+  conf.low = NA,
+  conf.high = NA,
+  p.value = NA
+)
+
+# Combine all components into a single table
+combined_table <- bind_rows(fixed_effects, random_effects, model_fit)
+
+# Create the formatted table
+combined_table %>%
+  kbl(caption = "Summary of the Final Model", digits = 3, col.names = c(
+    "Category", "Term", "Estimate", "Std. Error", "Conf. Low", "Conf. High", "P-value"
+  )) %>%
+  kable_styling(full_width = FALSE) %>%
+  pack_rows("Fixed Effects", 1, nrow(fixed_effects)) %>%
+  pack_rows("Random Effects", nrow(fixed_effects) + 1, nrow(fixed_effects) + nrow(random_effects)) %>%
+  pack_rows("Model Fit Statistics", nrow(fixed_effects) + nrow(random_effects) + 1, nrow(combined_table))
+
+# Load the necessary package
+library(writexl)
+
+# Combine the table into a single dataframe
+export_table <- bind_rows(fixed_effects, random_effects, model_fit)
+
+# Save as an Excel file
+write_xlsx(export_table, "final_model_summary.xlsx")
+
+# Print message confirming export
+print("Table successfully exported as final_model_summary.xlsx")
+```
+
+## Visualising trap performance across mosquito densities
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+library(forcats)
+library(viridis)  # Colorblind-friendly palette
+
+# Generate prediction dataset across mosquito densities
+prediction_data <- expand.grid(
+  Location_Density = seq(min(trap_totals$Location_Density, na.rm = TRUE), 
+                         max(trap_totals$Location_Density, na.rm = TRUE), length.out = 100),
+  Collection_Method = unique(trap_totals$Collection_Method),
+  NDWI = mean(trap_totals$NDWI, na.rm = TRUE),
+  Precip = mean(trap_totals$Precip, na.rm = TRUE),
+  Temperature = mean(trap_totals$Temperature, na.rm = TRUE),
+  Location = "Placeholder",
+  Date = as.Date("2024-01-01")
+)
+
+# Predict mosquito counts using the model
+prediction_data$Predicted_Count <- predict(location_interaction_model, 
+                                           newdata = prediction_data, type = "response")
+
+# Calculate proportional contribution of each method to total predicted counts at each density level
+prediction_data <- prediction_data %>%
+  group_by(Location_Density) %>%
+  mutate(Total_Predicted_Count = sum(Predicted_Count, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(Proportional_Collection_Success = Predicted_Count / Total_Predicted_Count) %>%
+  filter(!is.na(Proportional_Collection_Success))  # Remove NaNs or Inf values
+
+# Reorder Collection_Method factor to match the desired order
+prediction_data$Collection_Method <- factor(prediction_data$Collection_Method, 
+                                            levels = c("Aspiration", "Bin", "Bag", "Small_Bin", "BG", "CO2"))
+
+# Define a colorblind-friendly palette (using viridis)
+colorblind_palette <- viridis::viridis(6, option = "D")  # Option "D" provides distinct colors
+
+# Create a stacked area plot with colorblind-friendly visualization
+ggplot(prediction_data, aes(x = Location_Density, y = Proportional_Collection_Success, fill = Collection_Method)) +
+  geom_area(alpha = 0.9, color = "black", size = 0.3) +
+  scale_fill_manual(values = colorblind_palette,
+                    labels = c("Aspiration", "Large bin", "Felt bag", "Small bin", "BG-S", "PB")) +
+  labs(
+    x = "Mosquito Density at Location",
+    y = "Proportional Collection Success",
+    title = "Proportional Contribution of Collection Methods Across Mosquito Densities",
+    fill = "Collection Method"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    legend.position = "right"
+  )
+
+ggsave("Proportional_Collection_Success.tiff", width = 8, height = 6, dpi = 600, compression = "lzw")
+```
